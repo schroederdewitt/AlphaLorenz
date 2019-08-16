@@ -355,9 +355,9 @@ def plot(episode,
     axs[1, 1].set_title('frame %s. value loss: %s' % (episode, np.mean(value_losses[-10:])))
     axs[1, 1].plot(value_losses)
     axs[2, 0].set_title('frame %s. value: %s' % (episode, np.mean(values[-10:])))
-    axs[2, 0].plot(policy_losses)
+    axs[2, 0].plot(values)
     axs[2, 1].set_title('frame %s. target_values: %s' % (episode, np.mean(target_values[-10:])))
-    axs[2, 1].plot(value_losses)
+    axs[2, 1].plot(target_values)
     plt.show()
 
 ##################################################################################
@@ -399,10 +399,10 @@ while frame_idx < max_frames:
         if frame_idx % max(1000, max_steps + 1) == 0:
             plot(frame_idx,
                  rewards,
-                 [p.numpy() for p in policy_losses],
-                 [p.numpy() for p in values],
-                 [p.numpy() for p in target_values],
-                 [p.numpy() for p in value_losses],
+                 [p.detach().numpy() for p in policy_losses],
+                 [p.detach().numpy() for p in values],
+                 [p.detach().numpy() for p in target_values],
+                 [p.detach().numpy() for p in value_losses],
                  weights,
                  biases)
 
