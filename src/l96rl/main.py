@@ -34,7 +34,7 @@ class L96TwoLevelRL(L96TwoLevel):
                 self._history_Y.append(self.Y.copy())
 
 class L96Gym(gym.Env):
-    def __init__(self, lead_time=1., dt=0.01, action_bounds=(-20, 20)):
+    def __init__(self, lead_time=1., dt=0.01, action_bounds=(-1.0, 1.0), action_scale =20.0): # experimental
         """Lorenz 96 gym environment.
 
         Every reset a new random state from the history file is chosen for initial
@@ -63,7 +63,7 @@ class L96Gym(gym.Env):
 
         # do I really need an infinite observation space? Should I maybe tanh the observations or such?
         self.observation_space = gym.spaces.Box(-np.array([np.inf]), np.array([np.inf]))
-
+        self.action_scale = action_scale
         # load dataset
         # try:
         import xarray as xr
@@ -84,7 +84,7 @@ class L96Gym(gym.Env):
         return state[:, None]
 
     def step(self, action):
-        self.l96.step_with_B(action.squeeze())
+        self.l96.step_with_B(action.squeeze()) #*self.action_scale)
         state = self.l96.X.copy()
         self.step_count += 1
         if self.step_count >= self.nsteps:
@@ -130,7 +130,8 @@ def ddpg_update(batch_size,
                 gamma=0.99,
                 min_value=-np.inf,
                 max_value=np.inf,
-                soft_tau=1e-2):
+                soft_tau=1e-2,
+                cont_ep = False):
     state, action, reward, next_state, done = replay_buffer.sample(batch_size)
 
     state = th.FloatTensor(state).to(device)
@@ -147,8 +148,7 @@ def ddpg_update(batch_size,
     # Episodes should be continuous - i.e. non-terminating.
     # Otherwise the network has to learn what states are terminal - but those
     # are in no way different from those which aren't!
-    done = 0.0 # DEBUG
-    expected_value = reward + (1.0 - done) * gamma * target_value
+    expected_value = reward + (1.0 - done if not cont_ep else 0.0) * gamma * target_value
     expected_value = th.clamp(expected_value, min_value, max_value)
 
     value = value_net(state, action)
@@ -257,7 +257,7 @@ class PolicyNetworkLinear(nn.Module):
 
     def get_action(self, state):
         state = np.atleast_2d(state)
-        state = torch.FloatTensor(state).to(device)
+        state = th.FloatTensor(state).to(device)
         action = self.forward(state)
         return action.detach().cpu().numpy().squeeze()
 
@@ -275,7 +275,7 @@ class PolicyNetworkNN(nn.Module):
     def forward(self, state):
         x = F.relu(self.linear1(state))
         x = F.relu(self.linear2(x))
-        x = self.linear3(x)
+        x = F.tanh(self.linear3(x))
         return x
 
     def get_action(self, state):
@@ -310,7 +310,8 @@ for target_param, param in zip(target_policy_net.parameters(), policy_net.parame
     target_param.data.copy_(param.data)
 
 value_lr = 1e-3
-policy_lr = 1e-4
+policy_lr = 5e-4
+cont_ep = True
 
 from torch import optim
 value_optimizer = optim.Adam(value_net.parameters(), lr=value_lr)
@@ -321,7 +322,9 @@ value_criterion = nn.MSELoss()
 replay_buffer_size = 1000000
 replay_buffer = ReplayBuffer(replay_buffer_size)
 
-max_frames = 100_000
+max_frames = 100_000 # 100_000
+exploration_mode = "basic"
+noise_cutoff=10_000
 max_steps = 500
 frame_idx = 0
 rewards = []
@@ -333,6 +336,9 @@ biases = []
 # PLOTTING ROUTINES
 ##################################################################################
 
+def squash_state(s):
+    return s# / 10.0
+
 # Plotting function to track progress
 def plot(episode,
          rewards,
@@ -341,14 +347,16 @@ def plot(episode,
          target_values,
          value_losses,
          weights,
-         biases):
+         biases,
+         title):
     #clear_output(True)
     fig, axs = plt.subplots(3, 2, figsize=(10,5))
+    axs[0,1].set_title(title)
     axs[0,0].set_title('frame %s. reward: %s' % (episode, np.mean(rewards[-10:])))
     axs[0,0].plot(rewards)
-    axs[0,1].scatter(features[::1000], targets[::1000], s=5, alpha=0.2)
+    axs[0,1].scatter(squash_state(features[::1000]), targets[::1000], s=5, alpha=0.2)
     a = np.linspace(-10,15)
-    b = policy_net.get_action(a[:, None])
+    b = policy_net.get_action(squash_state(a[:, None]))
     axs[0, 1].plot(a, b, c='orange')
     axs[1, 0].set_title('frame %s. policy loss: %s' % (episode, np.mean(policy_losses[-10:])))
     axs[1, 0].plot(policy_losses)
@@ -370,41 +378,98 @@ values = []
 target_values = []
 value_losses = []
 
+
+plot_title = "lr_pol: {} lr_val: {} cont ep: {} expl: {}".format(
+    policy_lr,
+    value_lr,
+    cont_ep,
+    exploration_mode)
+
+def window_mean(lst, window_size):
+    """calculate mean over every window_size elements"""
+    n_div = len(lst) // window_size
+    n_rem = len(lst) % window_size
+    arr = np.array(lst)
+    part1 = arr[:n_div*window_size].reshape(-1, window_size).mean(axis=1)
+    part2 = arr[-n_rem:].mean(keepdims=True)
+    return np.concatenate([part1, part2])
+
+ou_noise_state = None # ornstein-uhlenbeck exploration state
+
 episode = 0
 while frame_idx < max_frames:
     state = env.reset()
+    state = squash_state(state)
+
     episode_reward = 0
 
+    policy_loss_ctr = 0.0
+    value_ctr = 0.0
+    target_value_ctr = 0.0
+    value_loss_ctr = 0.0
+    val_ctr = 0.0
+
     for step in range(max_steps):
+         # DEBUG
         action = policy_net.get_action(state)
         # I implement exploration noise like this
         # action = action * noise_slope + noise_bias
-        noise_slope = np.random.normal(1, 0.1)
-        noise_bias = np.random.normal(0, 0.1)
-        action = action * noise_slope + noise_bias
+
+        if exploration_mode == "basic":
+            noise_slope = np.random.normal(1, 0.1)
+            noise_bias = np.random.normal(0, 0.1)
+            if frame_idx < noise_cutoff:
+                action = action * noise_slope + noise_bias
+            # Now do appropriate noising
+        elif exploration_mode == "ou":
+            if ou_noise_state is None:
+                ou_noise_state = np.zeros_like(action)
+            mu = 0
+            theta = 0.15
+            sigma = 0.2
+            noise_scale = 0.3 if frame_idx < noise_cutoff else 0.0
+            dx = theta * (mu - action) + sigma * np.random.normal(size=action.shape)
+            ou_noise_state = ou_noise_state + dx
+            ou_noise = ou_noise_state * noise_scale
+            action = action + ou_noise
+         # elif exploration_mode == "maddpg":
+         #     uni = chosen_actions.clone().detach().uniform_()
+         #     chosen_actions = chosen_actions - th.log(
+         #         -th.log(uni))  # NOTE: Might have to take softmax here?? i.e. for particle envs lol
+
         next_state, reward, done, _ = env.step(action)
+        next_state = squash_state(next_state)
+        if done or step == max_steps-1: # reset ou exploration
+            ou_noise_state = None
 
         replay_buffer.push(state, action[:, None], reward, next_state, done)
         if len(replay_buffer) > batch_size:
-            policy_loss, value, target_value, value_loss = ddpg_update(batch_size)
-            policy_losses.append(policy_loss)
-            values.append(value)
-            target_values.append(target_value)
-            value_losses.append(value_loss)
+            policy_loss, value, target_value, value_loss = ddpg_update(batch_size,
+                                                                       cont_ep)
+            policy_loss_ctr += policy_loss
+            value_ctr += value
+            target_value_ctr += target_value
+            value_loss_ctr += value_loss
+            val_ctr += 1.0
 
         state = next_state
         episode_reward += reward
-        frame_idx += 1
+        frame_idx += 1.0
 
         if frame_idx % max(1000, max_steps + 1) == 0:
             plot(frame_idx,
                  rewards,
-                 [p.detach().numpy() for p in policy_losses],
-                 [p.detach().numpy() for p in values],
-                 [p.detach().numpy() for p in target_values],
-                 [p.detach().numpy() for p in value_losses],
+                 #window_mean([p.detach().mean().numpy() for p in policy_losses], max(1000, max_steps + 1)),
+                 #window_mean([p.detach().mean().numpy() for p in values], max(1000, max_steps + 1)),
+                 #window_mean([p.detach().mean().numpy() for p in target_values], max(1000, max_steps + 1)),
+                 #window_mean([p.detach().mean().numpy() for p in value_losses], max(1000, max_steps + 1)),
+                 [p.detach().mean().numpy() for p in policy_losses],
+                 [p.detach().mean().numpy() for p in values],
+                 [p.detach().mean().numpy() for p in target_values],
+                 [p.detach().mean().numpy() for p in value_losses],
                  weights,
-                 biases)
+                 biases,
+                 plot_title)
 
         if done:
             weights.append(policy_net.linear1.weight.cpu().detach().numpy()[0].copy())
@@ -413,5 +478,11 @@ while frame_idx < max_frames:
             break
 
     rewards.append(episode_reward)
+    policy_losses.append(policy_loss_ctr/val_ctr)
+    values.append(value_ctr/val_ctr)
+    target_values.append(target_value_ctr/val_ctr)
+    value_losses.append(value_loss_ctr/val_ctr)
+
+
 
 
